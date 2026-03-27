@@ -1,0 +1,8 @@
+[package]
+name = "vibegraph"
+version = "0.1.0"
+edition = "2021"
+description = "Vibegraph - Fast context memory graph database for LLMs"
+license = "MIT"
+
+[dependencies]
