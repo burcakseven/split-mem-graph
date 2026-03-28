@@ -272,6 +272,134 @@ impl Graph {
     pub fn remove_edge(&mut self, id: EdgeId) -> bool {
         self.remove_edge_internal(id, /*remove_from_source=*/ true)
     }
+
+    /// Traverse the graph from given start nodes up to max_depth hops (BFS).
+    ///
+    /// Returns all visited NodeIds in BFS order (starts first, then their
+    /// neighbors, etc.). Each node is returned exactly once.
+    ///
+    /// - Follows **outgoing** edges only (directed graph semantics).
+    /// - Skips deleted nodes and edges automatically.
+    /// - Useful for LLM context gathering: start from seed concepts and
+    ///   collect related context within a "distance" (depth) threshold.
+    ///
+    /// # Example
+    /// ```
+    /// # use vibegraph::{Graph, NodeId};
+    /// let mut g = Graph::new();
+    /// let a = g.add_node("A");
+    /// let b = g.add_node("B");
+    /// let c = g.add_node("C");
+    /// g.add_edge(a, b, "a->b");
+    /// g.add_edge(b, c, "b->c");
+    /// let ctx = g.traverse(&[a], 2); // collects A, B, C
+    /// ```
+    pub fn traverse(&self, starts: &[NodeId], max_depth: usize) -> Vec<NodeId> {
+        use std::collections::{HashSet, VecDeque};
+
+        if starts.is_empty() {
+            return Vec::new();
+        }
+
+        let mut visited: HashSet<NodeId> = HashSet::new();
+        let mut order: Vec<NodeId> = Vec::new();
+        let mut q: VecDeque<(NodeId, usize)> = VecDeque::new();
+
+        // Initialize queue with starts at depth 0
+        for &s in starts {
+            if self.get_node(s).is_some() && !visited.contains(&s) {
+                visited.insert(s);
+                order.push(s);
+                if max_depth > 0 {
+                    q.push_back((s, 0));
+                }
+            }
+        }
+
+        while let Some((node_id, depth)) = q.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            // Get outgoing edges from this node
+            let node = match self.get_node(node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            for &eid in &node.edges_out {
+                if let Some(edge) = self.get_edge(eid) {
+                    let next = edge.target;
+                    if !visited.contains(&next) {
+                        visited.insert(next);
+                        order.push(next);
+                        q.push_back((next, depth + 1));
+                    }
+                }
+            }
+        }
+
+        order
+    }
+
+    /// Traverse and also collect the edges that connect visited nodes.
+    ///
+    /// Returns (visited_nodes, visited_edges) where edges are those whose
+    /// source and target are both in the visited set AND the edge itself
+    /// was traversed during BFS (i.e., part of the reachable subgraph).
+    ///
+    /// Useful when you need the full subgraph for LLM context.
+    pub fn traverse_with_edges(&self, starts: &[NodeId], max_depth: usize) -> (Vec<NodeId>, Vec<EdgeId>) {
+        use std::collections::{HashSet, VecDeque};
+
+        if starts.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut visited_nodes: HashSet<NodeId> = HashSet::new();
+        let mut node_order: Vec<NodeId> = Vec::new();
+        let mut edge_order: Vec<EdgeId> = Vec::new();
+        let mut q: VecDeque<(NodeId, usize)> = VecDeque::new();
+
+        for &s in starts {
+            if self.get_node(s).is_some() && !visited_nodes.contains(&s) {
+                visited_nodes.insert(s);
+                node_order.push(s);
+                if max_depth > 0 {
+                    q.push_back((s, 0));
+                }
+            }
+        }
+
+        while let Some((node_id, depth)) = q.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            let node = match self.get_node(node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            for &eid in &node.edges_out {
+                if let Some(edge) = self.get_edge(eid) {
+                    let next = edge.target;
+                    // Record edge if target will be (or already) visited
+                    if !visited_nodes.contains(&next) {
+                        visited_nodes.insert(next);
+                        node_order.push(next);
+                        edge_order.push(eid);
+                        q.push_back((next, depth + 1));
+                    } else {
+                        // Edge to already-visited node (still part of subgraph)
+                        edge_order.push(eid);
+                    }
+                }
+            }
+        }
+
+        (node_order, edge_order)
+    }
 }
 
 #[cfg(test)]
@@ -853,5 +981,149 @@ mod tests {
         // Nodes are valid and reachable
         // (edge lists may have leftover entries from reused slots, which is
         //  fine — remove_node clears them; fresh nodes from new append are empty)
+    }
+
+    // ========================================================================
+    // TRAVERSAL TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_traverse_basic_bfs() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+        let d = g.add_node("D");
+
+        g.add_edge(a, b, "a->b");
+        g.add_edge(b, c, "b->c");
+        g.add_edge(a, d, "a->d");
+
+        // BFS from A with depth 2: A -> B,D -> C
+        let visited = g.traverse(&[a], 2);
+        assert_eq!(visited.len(), 4);
+        assert_eq!(visited[0], a);
+        // B and D are at depth 1 (order may vary since edges_out is Vec)
+        assert!(visited.contains(&b));
+        assert!(visited.contains(&d));
+        assert!(visited.contains(&c));
+    }
+
+    #[test]
+    fn test_traverse_depth_zero() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        g.add_edge(a, b, "a->b");
+
+        // Depth 0: only starts returned
+        let v = g.traverse(&[a], 0);
+        assert_eq!(v, vec![a]);
+    }
+
+    #[test]
+    fn test_traverse_multiple_starts() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+        g.add_edge(a, c, "a->c");
+        g.add_edge(b, c, "b->c");
+
+        // Start from both A and B
+        let v = g.traverse(&[a, b], 2);
+        assert!(v.contains(&a));
+        assert!(v.contains(&b));
+        assert!(v.contains(&c));
+        // No duplicates
+        assert_eq!(v.iter().filter(|&&n| n == c).count(), 1);
+    }
+
+    #[test]
+    fn test_traverse_skips_deleted() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+        g.add_edge(a, b, "a->b");
+        g.add_edge(b, c, "b->c");
+
+        // Delete B
+        g.remove_node(b);
+
+        // Traverse from A: should get A only (B deleted, C unreachable)
+        let v = g.traverse(&[a], 5);
+        assert_eq!(v, vec![a]);
+    }
+
+    #[test]
+    fn test_traverse_empty_starts() {
+        let g = Graph::new();
+        let v = g.traverse(&[], 3);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_traverse_with_edges_basic() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+        let e1 = g.add_edge(a, b, "a->b");
+        let e2 = g.add_edge(b, c, "b->c");
+
+        let (nodes, edges) = g.traverse_with_edges(&[a], 2);
+
+        assert_eq!(nodes.len(), 3);
+        assert!(nodes.contains(&a));
+        assert!(nodes.contains(&b));
+        assert!(nodes.contains(&c));
+
+        // Both edges should be collected
+        assert_eq!(edges.len(), 2);
+        assert!(edges.contains(&e1));
+        assert!(edges.contains(&e2));
+    }
+
+    #[test]
+    fn test_traverse_with_edges_skips_deleted_edges() {
+        let mut g = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let e = g.add_edge(a, b, "a->b");
+
+        g.remove_edge(e);
+
+        let (nodes, edges) = g.traverse_with_edges(&[a], 2);
+        assert_eq!(nodes, vec![a]);
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_traverse_llm_context_scenario() {
+        // Simulate LLM context gathering:
+        // Start from a "query" node, traverse to get related facts
+        let mut g = Graph::new();
+
+        let query = g.add_node("query: what is rust?");
+        let fact1 = g.add_node("fact: Rust is a systems language");
+        let fact2 = g.add_node("fact: Rust has ownership");
+        let fact3 = g.add_node("fact: Ownership prevents bugs");
+        let tag = g.add_node("tag: memory safety");
+
+        g.add_edge(query, fact1, "mentions");
+        g.add_edge(fact1, fact2, "related_to");
+        g.add_edge(fact2, fact3, "related_to");
+        g.add_edge(fact1, tag, "has_tag");
+
+        // Get context within 2 hops
+        let ctx = g.traverse(&[query], 2);
+
+        assert!(ctx.contains(&query));
+        assert!(ctx.contains(&fact1));
+        assert!(ctx.contains(&fact2));
+        assert!(ctx.contains(&tag));
+        // fact3 is at depth 3, should NOT be included
+        assert!(!ctx.contains(&fact3));
     }
 }
