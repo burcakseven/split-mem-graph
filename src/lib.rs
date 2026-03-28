@@ -653,4 +653,205 @@ mod tests {
         assert!(g.get_edge(e2).is_none());
         assert!(g.get_edge(e3).is_some());
     }
+
+    // ========================================================================
+    // COMPREHENSIVE FREELIST CORRECTNESS PROOF
+    // ========================================================================
+    //
+    // This test proves the freelist logic is correct by verifying:
+    // 1. Freelist starts empty on new graph
+    // 2. First add_node/add_edge grows the arrays (append)
+    // 3. remove_node/remove_edge populates the freelist (pushes old ID)
+    // 4. Next add_node/add_edge consumes freelist (pops) and reuses slot
+    // 5. Generation is bumped on reuse (old_gen + 1)
+    // 6. Old ID (stale generation) is rejected by get_node/get_edge -> None
+    // 7. New ID (bumped generation) succeeds -> Some
+    // 8. LIFO order: most recently freed slot is reused first (pop behavior)
+    // 9. No unbounded growth: arrays stay bounded under heavy churn
+    // 10. Edge freelist behaves identically to node freelist
+    // 11. Double-remove is idempotent (doesn't double-populate freelist)
+    // 12. Mixed node/edge churn is consistent
+    //
+    // If any of these invariants break, the test fails.
+
+    #[test]
+    fn test_freelist_comprehensive_proof() {
+        let mut g = Graph::new();
+
+        // --------------------------------------------------------------------
+        // 1) Freelist starts empty
+        // --------------------------------------------------------------------
+        assert!(
+            g.free_nodes.is_empty(),
+            "free_nodes must be empty on new graph"
+        );
+        assert!(
+            g.free_edges.is_empty(),
+            "free_edges must be empty on new graph"
+        );
+
+        // --------------------------------------------------------------------
+        // 2) First add_node grows array (no free slots yet)
+        // --------------------------------------------------------------------
+        let a = g.add_node("A"); // NodeId(0, 0)
+        assert_eq!(a, NodeId(0, 0), "first node should be (0, 0)");
+        assert_eq!(g.nodes.len(), 1, "nodes array grew to 1");
+        assert!(g.free_nodes.is_empty(), "freelist still empty after first add");
+
+        let b = g.add_node("B"); // NodeId(1, 0)
+        assert_eq!(b, NodeId(1, 0), "second node should be (1, 0)");
+        assert_eq!(g.nodes.len(), 2, "nodes array grew to 2");
+
+        // --------------------------------------------------------------------
+        // 3) remove_node populates freelist with the old ID
+        // --------------------------------------------------------------------
+        assert!(g.remove_node(a), "remove_node should succeed");
+        assert_eq!(g.free_nodes.len(), 1, "freelist has 1 entry after remove");
+        // The freelist stores the ID with its CURRENT generation at removal time
+        assert_eq!(
+            g.free_nodes[0],
+            NodeId(0, 0),
+            "freelist should store removed NodeId(0, 0)"
+        );
+        assert!(g.nodes[0].deleted, "slot 0 is tombstoned");
+
+        // Old ID is stale now (slot deleted)
+        assert!(g.get_node(a).is_none(), "get_node(old_id) must be None after remove");
+
+        // --------------------------------------------------------------------
+        // 4) add_node reuses freelist slot (doesn't grow array)
+        // --------------------------------------------------------------------
+        let a2 = g.add_node("A2");
+        assert_eq!(a2.0, 0, "reused slot 0");
+        assert_eq!(g.nodes.len(), 2, "array did NOT grow (reused slot)");
+        assert!(
+            g.free_nodes.is_empty(),
+            "freelist consumed (empty) after reuse"
+        );
+
+        // --------------------------------------------------------------------
+        // 5) Generation is bumped on reuse
+        // --------------------------------------------------------------------
+        assert_eq!(a2, NodeId(0, 1), "reused ID has gen 0+1 = 1");
+
+        // --------------------------------------------------------------------
+        // 6) Old ID (gen 0) is rejected; new ID (gen 1) succeeds
+        // --------------------------------------------------------------------
+        assert!(
+            g.get_node(a).is_none(),
+            "stale NodeId(0,0) must return None"
+        );
+        assert!(
+            g.get_node(a2).is_some(),
+            "new NodeId(0,1) must return Some"
+        );
+        assert_eq!(g.get_node(a2).unwrap().data, "A2");
+
+        // --------------------------------------------------------------------
+        // 7) LIFO order: remove two more, then add two → most recent first
+        // --------------------------------------------------------------------
+        let c = g.add_node("C"); // (2, 0)
+        let d = g.add_node("D"); // (3, 0)
+        assert_eq!(g.nodes.len(), 4);
+
+        assert!(g.remove_node(d)); // freelist: [(3,0)]
+        assert!(g.remove_node(c)); // freelist: [(3,0), (2,0)] (push order)
+
+        // Pop order is LIFO: (2,0) pops first (most recently pushed = c)
+        let c2 = g.add_node("C2");
+        assert_eq!(c2, NodeId(2, 1), "c's slot reused with gen+1");
+        let d2 = g.add_node("D2");
+        assert_eq!(d2, NodeId(3, 1), "d's slot reused with gen+1");
+
+        // --------------------------------------------------------------------
+        // 8) Edge freelist behaves identically
+        // --------------------------------------------------------------------
+        assert!(g.free_edges.is_empty(), "edge freelist empty initially");
+
+        let e1 = g.add_edge(a2, b, "a2->b"); // EdgeId(0, 0)
+        assert_eq!(e1, EdgeId(0, 0), "first edge is (0,0)");
+        assert_eq!(g.edges.len(), 1);
+
+        assert!(g.remove_edge(e1));
+        assert_eq!(g.free_edges.len(), 1, "edge freelist populated");
+        assert_eq!(g.free_edges[0], EdgeId(0, 0), "stores EdgeId(0,0)");
+
+        let e2 = g.add_edge(b, a2, "b->a2");
+        assert_eq!(e2, EdgeId(0, 1), "edge slot reused, gen bumped");
+        assert_eq!(g.edges.len(), 1, "edges array did not grow");
+        assert!(g.free_edges.is_empty(), "edge freelist consumed");
+
+        // Stale edge ID rejected
+        assert!(g.get_edge(e1).is_none(), "stale EdgeId(0,0) -> None");
+        assert!(g.get_edge(e2).is_some(), "new EdgeId(0,1) -> Some");
+
+        // --------------------------------------------------------------------
+        // 9) No unbounded growth under heavy churn
+        // --------------------------------------------------------------------
+        // Cycle: add 10 nodes + 9 edges, remove all, repeat 500 times
+        for cycle in 0..500 {
+            let mut ids = Vec::new();
+            for i in 0..10 {
+                ids.push(g.add_node(format!("c{}_{}", cycle, i)));
+            }
+            for i in 0..9 {
+                g.add_edge(ids[i], ids[i + 1], "chain");
+            }
+            for id in &ids {
+                assert!(g.remove_node(*id));
+            }
+        }
+        // Arrays should be bounded (only ~10 nodes, ~9 edges slots at any time)
+        assert!(
+            g.nodes.len() <= 20,
+            "nodes array should stay bounded: {}",
+            g.nodes.len()
+        );
+        assert!(
+            g.edges.len() <= 20,
+            "edges array should stay bounded: {}",
+            g.edges.len()
+        );
+
+        // --------------------------------------------------------------------
+        // 10) Double-remove is idempotent (doesn't double-populate freelist)
+        // --------------------------------------------------------------------
+        let x = g.add_node("X");
+        assert!(g.remove_node(x));
+        let freelist_len_before = g.free_nodes.len();
+        assert!(!g.remove_node(x), "second remove must return false");
+        assert_eq!(
+            g.free_nodes.len(),
+            freelist_len_before,
+            "freelist must NOT grow on double-remove"
+        );
+
+        // Same for edges
+        let y = g.add_node("Y");
+        let ex = g.add_edge(x, y, "xy"); // x was re-added earlier
+        assert!(g.remove_edge(ex));
+        let edge_fl_before = g.free_edges.len();
+        assert!(!g.remove_edge(ex), "second remove_edge must return false");
+        assert_eq!(
+            g.free_edges.len(),
+            edge_fl_before,
+            "edge freelist must NOT grow on double-remove"
+        );
+
+        // --------------------------------------------------------------------
+        // 11) Final consistency: graph still works after all churn
+        // --------------------------------------------------------------------
+        let final_a = g.add_node("FINAL_A");
+        let final_b = g.add_node("FINAL_B");
+        let final_e = g.add_edge(final_a, final_b, "final");
+
+        assert!(g.get_node(final_a).is_some());
+        assert!(g.get_node(final_b).is_some());
+        assert!(g.get_edge(final_e).is_some());
+        assert_eq!(g.get_edge(final_e).unwrap().data, "final");
+
+        // Nodes are valid and reachable
+        // (edge lists may have leftover entries from reused slots, which is
+        //  fine — remove_node clears them; fresh nodes from new append are empty)
+    }
 }
